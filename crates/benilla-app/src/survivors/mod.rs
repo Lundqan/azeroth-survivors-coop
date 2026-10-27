@@ -7,6 +7,7 @@
 mod abilities;
 mod auto;
 mod cards;
+mod coop;
 mod data;
 mod enemies;
 mod fill;
@@ -61,7 +62,7 @@ impl Plugin for SurvivorsPlugin {
                 (
                     hero::drop_stray_buttons,
                     hero::aim_cursor,
-                    mobility::cast_mobility,
+                    mobility::cast_mobility.run_if(coop::not_guest),
                     hero::drive_hero,
                     hero::place_camera,
                 )
@@ -85,7 +86,12 @@ impl Plugin for SurvivorsPlugin {
                     .after(WorldStage::Input)
                     .run_if(in_state(Phase::Playing))
                     // Entering a battleground raises its loading screen: the run waits behind it.
-                    .run_if(|l: Res<crate::loading_screen::LoadingScreen>| !l.covering()),
+                    .run_if(|l: Res<crate::loading_screen::LoadingScreen>| !l.covering())
+                    // A co-op guest only shows what the host simulates; a host waits for its guest
+                    // to finish loading.
+                    .run_if(coop::not_guest)
+                    .run_if(coop::mates_ready)
+                    .in_set(coop::Simulation),
             )
             .add_systems(
                 Update,
@@ -132,10 +138,14 @@ impl Plugin for SurvivorsPlugin {
                     .after(hud::show_panels),
             )
             .add_systems(OnEnter(Phase::Playing), unpause)
-            .add_systems(OnEnter(Phase::LevelUp), (pause, hud::roll_offer))
+            .add_systems(
+                OnEnter(Phase::LevelUp),
+                (pause, hud::roll_offer.run_if(coop::not_guest)),
+            )
             .add_systems(OnEnter(Phase::Paused), pause)
             .add_systems(OnEnter(Phase::GameOver), unpause)
-            .add_systems(OnEnter(Phase::Menu), (unpause, reset_run));
+            .add_systems(OnEnter(Phase::Menu), (unpause, reset_run))
+            .add_plugins(coop::plugin);
         if let Some(auto) = auto::from_env() {
             app.insert_resource(auto)
                 .add_systems(
@@ -267,6 +277,8 @@ pub(super) struct Run {
     pub won: bool,
     /// Seconds since the hero fell, while the death plays out.
     pub dead_t: Option<f32>,
+    /// Seconds a living teammate has stood over the fallen hero (co-op revive).
+    pub revive: f32,
     pub next_guid: u64,
     pub damage_done: f64,
     /// Bumped whenever abilities or passives change, so the HUD rebuilds the icon rows once.
@@ -301,6 +313,7 @@ impl Default for Run {
             rings: 0,
             won: false,
             dead_t: None,
+            revive: 0.0,
             next_guid: 1,
             damage_done: 0.0,
             version: 0,

@@ -3,6 +3,7 @@
 
 use bevy::prelude::*;
 
+use super::coop::Mate;
 use super::enemies::Enemy;
 use super::hero::{self, Hero};
 use super::units::{flat, Fx};
@@ -170,42 +171,98 @@ impl Run {
 }
 
 /// `F`: cast the mobility if it is learned and ready; ticks the cooldown and the running effect.
-#[allow(clippy::too_many_arguments)]
+/// A co-op guest's hero casts on the `F` its player sent ([`Mate::cast`]), toward its aim.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(super) fn cast_mobility(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     phase: Res<State<Phase>>,
     mut run: ResMut<Run>,
     world: WorldPoint,
-    mut hero: Query<(Entity, &mut Transform), With<Hero>>,
+    mut hero: Query<(Entity, &mut Transform, Option<&mut Mate>), With<Hero>>,
     mut enemies: Query<(Entity, &Transform, &mut Enemy), Without<Hero>>,
     selection: Res<super::Selection>,
     aim: Res<hero::AimPoint>,
     mut fx: Fx,
 ) {
     let dt = time.delta_secs();
+    let playing = *phase.get() == Phase::Playing;
+    for (me, mut tf, mate) in &mut hero {
+        let (r, press, aim_at): (&mut Run, bool, Option<Vec3>) = match mate {
+            Some(m) => {
+                let m = m.into_inner();
+                let press = std::mem::take(&mut m.cast);
+                let moved = {
+                    let aim_at = m.aim;
+                    tick(&mut m.run, dt);
+                    playing
+                        && press
+                        && cast(
+                            &mut m.run,
+                            me,
+                            &mut tf,
+                            aim_at,
+                            &mut enemies,
+                            &selection,
+                            &world,
+                            &mut fx,
+                        )
+                };
+                if moved {
+                    m.teleport = Some((tf.translation, yaw_of(&tf)));
+                }
+                continue;
+            }
+            None => (&mut *run, keys.just_pressed(KEY), aim.0),
+        };
+        tick(r, dt);
+        if playing && press {
+            cast(r, me, &mut tf, aim_at, &mut enemies, &selection, &world, &mut fx);
+        }
+    }
+}
+
+fn yaw_of(tf: &Transform) -> f32 {
+    let f = tf.rotation * Vec3::NEG_Z;
+    super::units::yaw_toward(f)
+}
+
+fn tick(run: &mut Run, dt: f32) {
     let m = &mut run.mobile;
     m.cd = (m.cd - dt).max(0.0);
     m.haste_t = (m.haste_t - dt).max(0.0);
     m.vanish_t = (m.vanish_t - dt).max(0.0);
-    if *phase.get() != Phase::Playing || run.dead_t.is_some() || !keys.just_pressed(KEY) {
-        return;
+}
+
+/// Cast `run`'s mobility from `tf` toward `cursor`; returns whether the hero was moved.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn cast(
+    run: &mut Run,
+    me: Entity,
+    tf: &mut Transform,
+    cursor: Option<Vec3>,
+    enemies: &mut Query<(Entity, &Transform, &mut Enemy), Without<Hero>>,
+    selection: &super::Selection,
+    world: &WorldPoint,
+    fx: &mut Fx,
+) -> bool {
+    if run.dead_t.is_some() {
+        return false;
     }
-    let Some(def) = run.mobility() else { return };
-    if run.mobile.cd > 0.0 {
-        return;
-    }
-    let Ok((me, mut tf)) = hero.single_mut() else {
-        return;
+    let Some(def) = run.mobility() else {
+        return false;
     };
+    if run.mobile.cd > 0.0 {
+        return false;
+    }
     let pos = tf.translation;
     let facing = tf.rotation * Vec3::NEG_Z;
     let facing = flat(facing).normalize_or(Vec3::NEG_Z);
     // Aimed at the cursor where there is one, else straight ahead.
-    let cursor = aim.0.filter(|a| flat(*a - pos).length() > 0.5);
+    let cursor = cursor.filter(|a| flat(*a - pos).length() > 0.5);
     let toward = cursor.map_or(facing, |a| flat(a - pos).normalize());
     // Keep any jump inside the battleground's leash.
-    let map = selection.map_def();
+    let map = selection.stage_def();
     let center = hero::arena(map);
     let leash = |p: Vec3| {
         let off = flat(p - center);
@@ -216,6 +273,7 @@ pub(super) fn cast_mobility(
         }
     };
     let ground = |p: Vec3| world.terrain_height_under(p).unwrap_or(p.y);
+    let mut moved = false;
     match def.kind {
         Move::Blink(yd) => {
             fx.cast(me, def.spell, &[me], None);
@@ -225,6 +283,7 @@ pub(super) fn cast_mobility(
             let mut to = leash(pos + toward * far);
             to.y = ground(to);
             tf.translation = to;
+            moved = true;
         }
         Move::Charge(yd) => {
             // The enemy in reach nearest the cursor (or the hero, with none).
@@ -253,6 +312,7 @@ pub(super) fn cast_mobility(
             let mut to = leash(to);
             to.y = ground(to);
             tf.translation = to;
+            moved = true;
         }
         Move::Haste(x) => {
             fx.cast(me, def.spell, &[me], None);
@@ -267,7 +327,7 @@ pub(super) fn cast_mobility(
         }
         Move::Scatter(r) => {
             fx.cast(me, def.spell, &[me], None);
-            for (_, t, mut en) in &mut enemies {
+            for (_, t, mut en) in enemies.iter_mut() {
                 if !en.dead && !en.boss && hero::reach(pos, t.translation) <= r {
                     en.fear_t = en.fear_t.max(def.secs);
                 }
@@ -275,4 +335,5 @@ pub(super) fn cast_mobility(
         }
     }
     run.mobile.cd = def.cooldown;
+    moved
 }

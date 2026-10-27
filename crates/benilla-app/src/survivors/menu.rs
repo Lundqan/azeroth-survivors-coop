@@ -528,10 +528,12 @@ pub(super) fn menu_clicks(
     mut run: ResMut<Run>,
     mut rng: ResMut<Rng>,
     mut next: ResMut<NextState<Phase>>,
+    coop: Option<Res<super::coop::Coop>>,
 ) {
     if *phase.get() != Phase::Menu {
         return;
     }
+    let guest = coop.as_deref().is_some_and(|c| c.is_guest());
     let Some(creatures) = creatures.as_deref() else {
         return;
     };
@@ -555,6 +557,8 @@ pub(super) fn menu_clicks(
                 selection.version += 1;
             }
         }
+        // A co-op guest's run starts when the host's does.
+        MenuAction::Enter if guest => {}
         MenuAction::Enter => {
             if start_run(&mut run, &mut selection) {
                 next.set(Phase::Playing);

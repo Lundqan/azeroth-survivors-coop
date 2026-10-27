@@ -5,6 +5,7 @@ use benilla_world::world_point::WorldPoint;
 use bevy::input::mouse::{AccumulatedMouseMotion, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 
+use super::coop::Mate;
 use super::data::{self, ClassDef};
 use super::units::{self, flat, wow_to_bevy, yaw_toward, Fx, Marks, UnitSpec};
 use super::{Phase, Run, Selection};
@@ -149,7 +150,7 @@ pub(super) struct AimPoint(pub(super) Option<Vec3>);
 pub(super) fn aim_cursor(
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     cams: Query<(&Camera, &Transform), With<WorldCamera>>,
-    hero: Query<&Transform, (With<Hero>, Without<WorldCamera>)>,
+    hero: Query<&Transform, (With<Hero>, Without<WorldCamera>, Without<Mate>)>,
     world: WorldPoint,
     mut aim: ResMut<AimPoint>,
 ) {
@@ -196,7 +197,7 @@ pub(super) fn drive_hero(
     world: WorldPoint,
     auto: Option<Res<super::auto::Auto>>,
     mut player: ResMut<crate::player::Player>,
-    mut hero: Query<(&mut Transform, &mut MovementState, &mut Hero)>,
+    mut hero: Query<(&mut Transform, &mut MovementState, &mut Hero), Without<Mate>>,
 ) {
     let focus = match hero.single_mut() {
         Ok((mut tf, mut mv, mut hm)) => {
@@ -341,7 +342,7 @@ pub(super) fn place_camera(
     keys: Res<ButtonInput<KeyCode>>,
     player: Res<crate::player::Player>,
     world: WorldPoint,
-    hero: Query<&Transform, (With<Hero>, Without<WorldCamera>)>,
+    hero: Query<&Transform, (With<Hero>, Without<WorldCamera>, Without<Mate>)>,
     mut cams: Query<&mut Transform, With<WorldCamera>>,
 ) {
     // `C` unlocks the camera to swing and tilt; locking it again snaps back to the top-down view,
@@ -413,28 +414,127 @@ pub(super) fn hurt_hero(run: &mut Run, raw: f32) -> f32 {
     dmg
 }
 
-/// The clock, regeneration, the timed buffs and their visuals, death and victory.
+/// Seconds a living teammate stands over a fallen one to bring them back.
+pub(super) const REVIVE_SECS: f32 = 3.0;
+/// How close the reviver must stand, in yards.
+pub(super) const REVIVE_REACH: f32 = 3.5;
+
+/// The clock, regeneration, the timed buffs and their visuals, death and victory, for every hero
+/// (the local one on [`Run`], a co-op guest's on its [`Mate`]). The clock runs while anyone stands;
+/// the run is lost when everyone has fallen.
+#[allow(clippy::type_complexity)]
 pub(super) fn hero_vitals(
     time: Res<Time>,
     mut run: ResMut<Run>,
     mut next: ResMut<NextState<Phase>>,
-    mut hero: Query<(Entity, &Guid, &mut ObjectStore, &mut Marks), With<Hero>>,
+    mut heroes: Query<
+        (
+            Entity,
+            &Guid,
+            &Transform,
+            &mut ObjectStore,
+            &mut Marks,
+            Option<&mut Mate>,
+        ),
+        With<Hero>,
+    >,
     mut fields: MessageWriter<FieldChanged>,
     mut fx: Fx,
 ) {
     let dt = time.delta_secs();
-    let stats = run.stats();
-    let Ok((entity, guid, mut store, mut marks)) = hero.single_mut() else {
+    // Who stands, and where, before anyone's state moves this frame.
+    let standing: Vec<(Entity, Vec3)> = heroes
+        .iter()
+        .filter(|(_, _, _, _, _, mate)| match mate {
+            Some(m) => m.run.dead_t.is_none(),
+            None => run.dead_t.is_none(),
+        })
+        .map(|(e, _, tf, ..)| (e, tf.translation))
+        .collect();
+    if heroes.is_empty() {
         return;
-    };
+    }
+    if !standing.is_empty() {
+        run.elapsed += dt;
+    }
+    let mut all_gone = true;
+    for (entity, guid, tf, mut store, mut marks, mate) in &mut heroes {
+        let near = standing
+            .iter()
+            .any(|&(e, p)| e != entity && reach(p, tf.translation) <= REVIVE_REACH);
+        let r: &mut Run = match mate {
+            Some(m) => &mut m.into_inner().run,
+            None => &mut *run,
+        };
+        vitals(
+            r,
+            dt,
+            entity,
+            guid.0,
+            &mut store,
+            &mut marks,
+            &mut fields,
+            &mut fx,
+            near,
+        );
+        if r.dead_t.is_none_or(|t| t <= 3.0) {
+            all_gone = false;
+        }
+    }
+    if all_gone {
+        next.set(Phase::GameOver);
+    } else if !standing.is_empty() && run.elapsed >= data::VICTORY_SECS {
+        run.won = true;
+        // A last flourish before the results.
+        for &(e, _) in &standing {
+            fx.cast(e, 642, &[e], None);
+        }
+        next.set(Phase::GameOver);
+    }
+}
+
+/// One hero's frame: a fallen one waits (or is revived by a teammate standing `near`); a standing
+/// one ticks its buffs, regenerates, shows its state kits, and may fall.
+#[allow(clippy::too_many_arguments)]
+fn vitals(
+    run: &mut Run,
+    dt: f32,
+    entity: Entity,
+    guid: u64,
+    store: &mut ObjectStore,
+    marks: &mut Marks,
+    fields: &mut MessageWriter<FieldChanged>,
+    fx: &mut Fx<'_>,
+    near: bool,
+) {
+    let stats = run.stats();
     if let Some(t) = run.dead_t.as_mut() {
         *t += dt;
-        if *t > 3.0 {
-            next.set(Phase::GameOver);
+        if near {
+            run.revive += dt;
+            if run.revive >= REVIVE_SECS {
+                run.dead_t = None;
+                run.revive = 0.0;
+                run.hp = stats.max_hp * 0.4;
+                // A moment's grace to get clear of the horde.
+                run.immune_t = 2.0;
+                units::revive_unit(store);
+                // Resurrection's visual.
+                fx.cast(entity, 2006, &[entity], None);
+                fields.write(FieldChanged {
+                    entity,
+                    guid,
+                    kind: benilla_protocol::messages::ObjectType::Unit,
+                    index: units::FIELD_HEALTH_INDEX,
+                    old: 0,
+                    new: 100,
+                });
+            }
+        } else {
+            run.revive = 0.0;
         }
         return;
     }
-    run.elapsed += dt;
     let r = &mut *run;
     for t in [&mut r.shield_t, &mut r.immune_t, &mut r.thorns_t] {
         *t = (*t - dt).max(0.0);
@@ -469,19 +569,15 @@ pub(super) fn hero_vitals(
         shown.push(139);
     }
     marks.set(&shown);
-    marks.flush(entity, guid.0, &mut store, &mut fields);
+    marks.flush(entity, guid, store, fields);
 
     if run.hp <= 0.0 {
         run.hp = 0.0;
         run.dead_t = Some(0.0);
-        units::kill_unit(&mut store);
+        run.revive = 0.0;
+        units::kill_unit(store);
         marks.clear();
-        marks.flush(entity, guid.0, &mut store, &mut fields);
-    } else if run.elapsed >= data::VICTORY_SECS {
-        run.won = true;
-        // A last flourish before the results.
-        fx.cast(entity, 642, &[entity], None);
-        next.set(Phase::GameOver);
+        marks.flush(entity, guid, store, fields);
     }
 }
 

@@ -409,6 +409,8 @@ pub(super) fn animate_cards(
     mut offer: ResMut<Offer>,
     mut rng: ResMut<Rng>,
     mut next: ResMut<NextState<Phase>>,
+    coop: Option<Res<super::coop::Coop>>,
+    mates: Query<&super::coop::Mate>,
 ) {
     if *phase.get() != Phase::LevelUp {
         pending.0 = None;
@@ -500,7 +502,17 @@ pub(super) fn animate_cards(
         if *t >= PICK_SECS {
             let i = *i;
             pending.0 = None;
-            hud::pick(i, &mut run, &mut offer, &mut rng, &mut next);
+            match coop.as_deref().filter(|c| c.is_guest()) {
+                // A guest's card is the host's to apply; its run comes back with the next state.
+                Some(c) => {
+                    c.send_card(i);
+                    offer.set(Vec::new());
+                }
+                None => {
+                    let hold = mates.iter().any(|m| m.run.pending_levels > 0);
+                    hud::pick(i, &mut run, &mut offer, &mut rng, &mut next, hold);
+                }
+            }
         }
     }
 }

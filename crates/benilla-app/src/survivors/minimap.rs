@@ -360,7 +360,7 @@ pub(super) fn compose(
     catalog: Option<Res<MapCatalogRes>>,
     current: Option<Res<CurrentMap>>,
     phase: Res<State<super::Phase>>,
-    hero: Query<&Transform, With<Hero>>,
+    hero: Query<&Transform, (With<Hero>, Without<super::coop::Mate>)>,
     enemies: Query<(&Transform, &Enemy)>,
     mut images: ResMut<Assets<Image>>,
     time: Res<Time<Real>>,

@@ -112,7 +112,7 @@ pub(super) fn plan(
     time: Res<Time<Real>>,
     mut auto: ResMut<Auto>,
     selection: Res<Selection>,
-    hero: Query<&Transform, With<Hero>>,
+    hero: Query<&Transform, (With<Hero>, Without<super::coop::Mate>)>,
     gems: Query<&Transform, (With<Gem>, Without<Hero>)>,
     foes: Query<(&Transform, &Enemy), Without<Hero>>,
 ) {
@@ -163,7 +163,7 @@ pub(super) fn drive(
     mut offer: ResMut<Offer>,
     mut rng: ResMut<Rng>,
     loading: Res<crate::loading_screen::LoadingScreen>,
-    heroes: Query<(), With<Hero>>,
+    heroes: Query<(), (With<Hero>, Without<super::coop::Mate>)>,
     enemies: Query<&Enemy>,
 ) {
     let dt = time.delta_secs();
@@ -222,7 +222,7 @@ pub(super) fn drive(
             if auto.wait > 1.6 {
                 let n = offer.len().max(1);
                 let i = (rng.range(0.0, n as f32) as usize).min(n - 1);
-                hud::pick(i, &mut run, &mut offer, &mut rng, &mut next);
+                hud::pick(i, &mut run, &mut offer, &mut rng, &mut next, false);
                 auto.wait = 0.0;
             }
         }

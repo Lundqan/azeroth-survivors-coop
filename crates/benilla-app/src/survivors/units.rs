@@ -12,6 +12,8 @@ use crate::creature_anim::{CastEvent, CastEventKind, PlaySeq, SpellGoTargets, Sw
 use crate::net::{FieldChanged, Guid, NetEntity, ObjectStore};
 
 const FIELD_HEALTH: u16 = 22;
+/// `UNIT_FIELD_HEALTH`, for the edges a revive rings.
+pub(super) const FIELD_HEALTH_INDEX: u16 = FIELD_HEALTH;
 const FIELD_MAX_HEALTH: u16 = 28;
 const FIELD_LEVEL: u16 = 34;
 const FIELD_FACTION: u16 = 35;
@@ -27,6 +29,11 @@ pub(super) const FACTION_FRIENDLY: u32 = 35;
 pub(super) const FACTION_MONSTER: u32 = 14;
 
 const HIGH_CREATURE: u64 = 0xF130 << 48;
+
+/// The guid [`spawn_unit`] gives a creature of this serial.
+pub(super) fn creature_guid(serial: u64) -> u64 {
+    HIGH_CREATURE | serial
+}
 const HIGH_GAMEOBJECT: u64 = 0xF110 << 48;
 const HIGH_DYNAMIC: u64 = 0xF100 << 48;
 
@@ -112,6 +119,40 @@ pub(super) fn spawn_unit(commands: &mut Commands, spec: &UnitSpec, pos: Vec3, ya
         .id()
 }
 
+/// A co-op guest's copy of an object its host spawned: the same guid, kind, display and fields,
+/// so the attach, animation and spell-visual systems build and drive the same body.
+pub(super) fn spawn_replica(
+    commands: &mut Commands,
+    guid: u64,
+    kind: benilla_protocol::EntityKind,
+    display: Option<u32>,
+    scale: f32,
+    pairs: &[(u16, u32)],
+    pos: Vec3,
+    yaw: f32,
+) -> Entity {
+    let unit = matches!(kind, benilla_protocol::EntityKind::Unit);
+    let mut e = commands.spawn((
+        Guid(guid),
+        NetEntity {
+            kind,
+            display_id: display,
+            scale,
+        },
+        ObjectStore(ObjectFields::from_pairs(pairs)),
+        Transform::from_translation(pos).with_rotation(Quat::from_rotation_y(yaw)),
+        Visibility::default(),
+        RunEntity,
+    ));
+    if unit {
+        e.insert((
+            crate::creature_anim::MovementState::default(),
+            crate::net::ScriptedFacing,
+        ));
+    }
+    e.id()
+}
+
 /// Spawn a generic GameObject showing `GameObjectDisplayInfo` row `display`.
 pub(super) fn spawn_object(
     commands: &mut Commands,
@@ -151,6 +192,13 @@ pub(super) fn kill_unit(store: &mut ObjectStore) {
     store
         .0
         .merge(ObjectFields::from_pairs(&[(FIELD_HEALTH, 0)]));
+}
+
+/// Health back: the animation selector lets the corpse pose go and the unit stands.
+pub(super) fn revive_unit(store: &mut ObjectStore) {
+    store
+        .0
+        .merge(ObjectFields::from_pairs(&[(FIELD_HEALTH, 100)]));
 }
 
 /// A dynamic object, as a ground spell's server would place it: the dest-effect systems arm the
@@ -296,6 +344,35 @@ impl Marks {
     }
 }
 
+/// Every effect [`Fx`] played this frame, kept for a co-op host to send its guest; present only
+/// on a host.
+#[derive(Resource, Default)]
+pub(super) struct FxLog(pub(super) Vec<FxRec>);
+
+pub(super) enum FxRec {
+    Go {
+        caster: Entity,
+        spell: u32,
+        hits: Vec<Entity>,
+        dest: Option<Vec3>,
+    },
+    Impact {
+        target: Entity,
+        spell: u32,
+    },
+    Swing {
+        attacker: Entity,
+        victim: Entity,
+        damage: f32,
+    },
+    Number {
+        anchor: Entity,
+        amount: f32,
+        crit: bool,
+        color: u32,
+    },
+}
+
 /// The messages that make a local cast look like a server's.
 #[derive(SystemParam)]
 pub(super) struct Fx<'w> {
@@ -304,6 +381,7 @@ pub(super) struct Fx<'w> {
     gos: MessageWriter<'w, SpellGoTargets>,
     swings: MessageWriter<'w, SwingMessage>,
     text: MessageWriter<'w, CombatTextSpawn>,
+    log: Option<ResMut<'w, FxLog>>,
 }
 
 /// More impacts than this per cast only cost frames.
@@ -312,6 +390,14 @@ const MAX_VISUAL_HITS: usize = 12;
 impl Fx<'_> {
     /// `SMSG_SPELL_GO`: the cast kit on the caster, and a missile or an impact at each hit.
     pub fn cast(&mut self, caster: Entity, spell: u32, hits: &[Entity], dest: Option<Vec3>) {
+        if let Some(log) = self.log.as_mut() {
+            log.0.push(FxRec::Go {
+                caster,
+                spell,
+                hits: hits.iter().copied().take(MAX_VISUAL_HITS).collect(),
+                dest,
+            });
+        }
         let seq = self.seq.next();
         self.casts.write(CastEvent {
             entity: caster,
@@ -332,6 +418,9 @@ impl Fx<'_> {
 
     /// Only the spell's impact kit, on `target`: no cast animation on anyone.
     pub fn impact(&mut self, target: Entity, spell: u32) {
+        if let Some(log) = self.log.as_mut() {
+            log.0.push(FxRec::Impact { target, spell });
+        }
         let seq = self.seq.next();
         self.casts.write(CastEvent {
             entity: target,
@@ -345,6 +434,13 @@ impl Fx<'_> {
 
     /// A melee swing: the attack animation, the victim's flinch, blood and the hit sound.
     pub fn swing(&mut self, attacker: Entity, victim: Entity, damage: f32) {
+        if let Some(log) = self.log.as_mut() {
+            log.0.push(FxRec::Swing {
+                attacker,
+                victim,
+                damage,
+            });
+        }
         let seq = self.seq.next();
         self.swings.write(SwingMessage {
             attacker,
@@ -359,6 +455,14 @@ impl Fx<'_> {
 
     /// A floating number over `anchor`, 0xAARRGGBB.
     pub fn number(&mut self, anchor: Entity, amount: f32, crit: bool, color: u32) {
+        if let Some(log) = self.log.as_mut() {
+            log.0.push(FxRec::Number {
+                anchor,
+                amount,
+                crit,
+                color,
+            });
+        }
         let shown = amount.round().max(1.0) as i64;
         self.text.write(CombatTextSpawn {
             anchor,

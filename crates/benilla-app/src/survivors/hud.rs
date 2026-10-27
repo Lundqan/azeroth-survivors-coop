@@ -14,6 +14,7 @@ use bevy::window::PrimaryWindow;
 use super::data::{self, AbilityDef, Effect, Kind, PassiveDef, Stat};
 use super::hero::{self, Hero};
 use super::minimap::{self, MiniMap};
+use super::coop::{self, Mate};
 use super::{Owned, Phase, Rng, Run, Selection, Stats};
 
 const GOLD: Color = Color::srgb(1.0, 0.82, 0.0);
@@ -186,6 +187,11 @@ pub(super) struct Offer {
 }
 
 impl Offer {
+    /// A co-op guest's cards, as its host dealt them.
+    pub(super) fn set(&mut self, choices: Vec<Choice>) {
+        self.choices = choices;
+    }
+
     pub(super) fn len(&self) -> usize {
         self.choices.len()
     }
@@ -858,7 +864,7 @@ pub(super) fn menu_preview(
     phase: Res<State<Phase>>,
     selection: Res<Selection>,
     mut run: ResMut<Run>,
-    heroes: Query<Entity, With<Hero>>,
+    heroes: Query<Entity, (With<Hero>, Without<Mate>)>,
     world: benilla_world::world_point::WorldPoint,
     mut shown: Local<Option<(usize, u32, usize)>>,
 ) {
@@ -905,10 +911,16 @@ pub(super) fn start_run(run: &mut Run, selection: &mut Selection) -> bool {
     // The world goes to the battleground picked; until now it stood in the last one.
     selection.stage = selection.map;
     let next_guid = run.next_guid;
-    *run = Run {
+    *run = fresh_run(class, race);
+    run.next_guid = next_guid;
+    true
+}
+
+/// A new run's state for `class`: its starting spell, full health.
+pub(super) fn fresh_run(class: &'static data::ClassDef, race: u8) -> Run {
+    let mut run = Run {
         class,
         race,
-        next_guid,
         ..Run::default()
     };
     run.abilities.push(Owned {
@@ -918,10 +930,10 @@ pub(super) fn start_run(run: &mut Run, selection: &mut Selection) -> bool {
     });
     run.hp = run.stats().max_hp;
     run.version += 1;
-    true
+    run
 }
 
-fn choices_for(run: &Run, rng: &mut Rng) -> Vec<Choice> {
+pub(super) fn choices_for(run: &Run, rng: &mut Rng) -> Vec<Choice> {
     let mut pool: Vec<(Choice, f32)> = Vec::new();
     for (i, o) in run.abilities.iter().enumerate() {
         if o.level < data::MAX_ABILITY_LEVEL {
@@ -971,35 +983,53 @@ pub(super) fn roll_offer(run: Res<Run>, mut rng: ResMut<Rng>, mut offer: ResMut<
     offer.choices = choices_for(&run, &mut rng);
 }
 
+/// Take card `i`. With every card picked the run resumes, unless `hold`: a co-op teammate is still
+/// choosing, and the host resumes once they are done.
 pub(super) fn pick(
     i: usize,
     run: &mut Run,
     offer: &mut Offer,
     rng: &mut Rng,
     next: &mut NextState<Phase>,
+    hold: bool,
 ) {
     let Some(&choice) = offer.choices.get(i) else {
         return;
     };
+    apply_choice(run, choice);
+    if run.pending_levels > 0 {
+        offer.choices = choices_for(run, rng);
+    } else {
+        offer.choices.clear();
+        if !hold {
+            next.set(Phase::Playing);
+        }
+    }
+}
+
+/// What a card does to the run that took it.
+pub(super) fn apply_choice(run: &mut Run, choice: Choice) {
     match choice {
         Choice::NewAbility(def) => run.abilities.push(Owned {
             def,
             level: 1,
             cd: 0.3,
         }),
-        Choice::Upgrade(k) => run.abilities[k].level += 1,
+        Choice::Upgrade(k) => {
+            if let Some(o) = run.abilities.get_mut(k) {
+                o.level += 1;
+            }
+        }
         Choice::NewPassive(p) => run.passives.push((p, 1)),
-        Choice::UpPassive(k) => run.passives[k].1 += 1,
+        Choice::UpPassive(k) => {
+            if let Some(p) = run.passives.get_mut(k) {
+                p.1 += 1;
+            }
+        }
         Choice::Heal => run.hp = run.stats().max_hp,
     }
     run.version += 1;
     run.pending_levels = run.pending_levels.saturating_sub(1);
-    if run.pending_levels > 0 {
-        offer.choices = choices_for(run, rng);
-    } else {
-        offer.choices.clear();
-        next.set(Phase::Playing);
-    }
 }
 
 pub(super) fn looks_for(
@@ -1027,6 +1057,7 @@ pub(super) fn buttons(
     mut next: ResMut<NextState<Phase>>,
     mut exit: MessageWriter<AppExit>,
     phase: Res<State<Phase>>,
+    mut coop: Option<ResMut<coop::Coop>>,
 ) {
     for (interaction, action, base, mut bg) in &mut presses {
         match interaction {
@@ -1034,6 +1065,22 @@ pub(super) fn buttons(
             Interaction::None => bg.0 = base.0,
             Interaction::Pressed => {
                 bg.0 = BUTTON_HOT;
+                // A co-op guest asks the host, which owns the run's screens.
+                if let Some(c) = coop.as_deref_mut().filter(|c| c.is_guest()) {
+                    match (*action, *phase.get()) {
+                        (UiAction::Resume, Phase::Paused) => c.request(coop::REQUEST_RESUME),
+                        (UiAction::MainMenu, Phase::Paused | Phase::GameOver) => {
+                            c.leave();
+                            next.set(Phase::Menu);
+                        }
+                        (UiAction::Quit, Phase::Paused | Phase::GameOver) => {
+                            c.leave();
+                            exit.write(AppExit::Success);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 match (*action, *phase.get()) {
                     (UiAction::Resume, Phase::Paused) => next.set(Phase::Playing),
                     (UiAction::MainMenu, Phase::Paused | Phase::GameOver) => next.set(Phase::Menu),
@@ -1053,7 +1100,17 @@ pub(super) fn keys(
     mut selection: ResMut<Selection>,
     mut run: ResMut<Run>,
     mut next: ResMut<NextState<Phase>>,
+    coop: Option<Res<coop::Coop>>,
 ) {
+    // A co-op guest's run is the host's: Esc asks the host to pause, the rest waits for it.
+    if let Some(c) = coop.as_deref().filter(|c| c.is_guest()) {
+        if matches!(phase.get(), Phase::Playing | Phase::Paused)
+            && keys.just_pressed(KeyCode::Escape)
+        {
+            c.request(coop::REQUEST_PAUSE);
+        }
+        return;
+    }
     match phase.get() {
         Phase::Menu => {
             if keys.just_pressed(KeyCode::Enter) && start_run(&mut run, &mut selection) {
@@ -1510,7 +1567,7 @@ const PLATE_NUDGE: f32 = 2.0;
 pub(super) fn hero_plate(
     run: Res<Run>,
     ui_scale: Res<UiScale>,
-    hero: Query<&Transform, With<Hero>>,
+    hero: Query<&Transform, (With<Hero>, Without<Mate>)>,
     cams: Query<(&Camera, &Transform), With<WorldCamera>>,
     mut nodes: ParamSet<(
         Query<(&mut Node, &mut Visibility), With<HpFrame>>,

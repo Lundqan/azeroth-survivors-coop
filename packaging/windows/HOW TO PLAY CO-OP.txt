@@ -1,0 +1,34 @@
+AZEROTH SURVIVORS - CO-OP (2 players)
+=====================================
+
+SETUP (both players)
+1. You both need the World of Warcraft 1.12.1 game data (the "Data" folder).
+2. Copy everything from this download into your WoW 1.12.1 folder,
+   so that warcraft-survivors.exe sits right next to the "Data" folder.
+
+PLAY TOGETHER
+- The HOST double-clicks "Host co-op.bat".
+  The top of the menu shows the IP your friend should use.
+  The first time, Windows asks to allow network access - click Allow.
+- The FRIEND double-clicks "Join co-op.bat" and types the host's IP.
+- Both pick a hero. The host picks the zone and presses Enter World.
+
+CONNECTING OVER THE INTERNET
+Easiest: both install Tailscale (free, tailscale.com) and log in to the
+same Tailscale network. The friend then joins with the host's Tailscale
+IP (starts with 100.). No router setup needed.
+Alternative: the host forwards TCP port 7777 on their router and the
+friend uses the host's public IP.
+On the same home network, the LAN IP shown in the menu works directly.
+
+IN THE GAME
+- Experience is shared. On level-up you each pick your own card.
+- If one of you falls, the other stands next to them for 3 seconds
+  to revive them. The run ends when you are both down.
+- Esc pauses for both players.
+- WASD move, Space jump, F class movement spell, C free camera.
+
+PLAY ALONE
+Double-click "Play solo.bat" (or warcraft-survivors.exe).
+
+Both players must use the same exe version.

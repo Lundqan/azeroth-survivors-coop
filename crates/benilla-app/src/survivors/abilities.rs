@@ -3,6 +3,7 @@
 
 use bevy::prelude::*;
 
+use super::coop::Mate;
 use super::data::{AbilityDef, Effect, Kind};
 use super::enemies::{self, Enemy, Loot};
 use super::hero::{self, Hero};
@@ -24,6 +25,8 @@ pub(super) struct Hit {
     pub splash: f32,
     pub crit: bool,
     pub color: u32,
+    /// The hero whose spell this is: drains heal them and the damage counts on their results.
+    pub src: Option<Entity>,
 }
 
 impl Hit {
@@ -39,6 +42,7 @@ impl Hit {
             splash: 0.0,
             crit,
             color: COLOR_MELEE,
+            src: None,
         }
     }
 }
@@ -61,6 +65,9 @@ pub(super) struct GroundArea {
     mark: u32,
     /// The spell whose impact plays on each enemy a tick hits, 0 for none.
     impact: u32,
+    /// The caster's crit chance and the caster, fixed when it was laid.
+    crit: f32,
+    src: Option<Entity>,
 }
 
 #[derive(Component)]
@@ -72,6 +79,8 @@ pub(super) struct Totem {
     left: f32,
     tick: f32,
     pulse: bool,
+    crit: f32,
+    src: Option<Entity>,
 }
 
 #[derive(Clone, Copy)]
@@ -102,8 +111,16 @@ fn mark_secs(def: &AbilityDef, duration: f32) -> f32 {
     }
 }
 
-fn hit_for(def: &AbilityDef, p: &Params, target: Entity, damage: f32, crit: bool) -> Hit {
+fn hit_for(
+    def: &AbilityDef,
+    p: &Params,
+    target: Entity,
+    damage: f32,
+    crit: bool,
+    src: Entity,
+) -> Hit {
     Hit {
+        src: Some(src),
         target,
         damage,
         dot: p.dot,
@@ -193,44 +210,105 @@ fn entities(foes: &[Foe]) -> Vec<Entity> {
     foes.iter().map(|f| f.e).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn cast_abilities(
     mut commands: Commands,
     time: Res<Time>,
     mut run: ResMut<Run>,
     mut rng: ResMut<Rng>,
     spells: Option<Res<crate::ui_action::Spells>>,
-    hero: Query<(Entity, &Transform), With<Hero>>,
+    mut hero: Query<(Entity, &Transform, Option<&mut Mate>), With<Hero>>,
     enemies: Query<(Entity, &Transform, &Enemy)>,
     mut fx: Fx,
     mut pending: ResMut<PendingHits>,
     mut hits: MessageWriter<Hit>,
 ) {
     let dt = time.delta_secs();
-    if run.dead_t.is_some() || dt <= 0.0 {
+    if dt <= 0.0 {
         return;
     }
-    let Ok((me, htf)) = hero.single() else { return };
-    let hpos = htf.translation;
-    let stats = run.stats();
-    let now = run.elapsed;
-    let mut foes: Vec<Foe> = enemies
+    let live: Vec<(Entity, Vec3, f32, f32)> = enemies
         .iter()
         .filter(|(_, _, e)| !e.dead)
-        .map(|(e, tf, en)| Foe {
-            e,
-            pos: tf.translation,
-            hp: en.hp,
-            dist: hero::reach(hpos, tf.translation),
-            radius: en.radius,
-        })
+        .map(|(e, tf, en)| (e, tf.translation, en.hp, en.radius))
         .collect();
-    foes.sort_by(|a, b| a.dist.total_cmp(&b.dist));
     let speed_of = |spell: u32| {
         spells
             .as_deref()
             .and_then(|s| s.catalog.get(spell))
             .map_or(0.0, |d| d.speed)
     };
+    let now = run.elapsed;
+    for (me, htf, mate) in &mut hero {
+        match mate {
+            Some(mut m) => {
+                // Guids come off the team's one counter.
+                m.run.next_guid = run.next_guid;
+                cast_for(
+                    &mut m.run,
+                    me,
+                    htf.translation,
+                    now,
+                    dt,
+                    &live,
+                    &mut commands,
+                    &mut rng,
+                    &mut fx,
+                    &mut pending,
+                    &mut hits,
+                    &speed_of,
+                );
+                run.next_guid = m.run.next_guid;
+            }
+            None => cast_for(
+                &mut run,
+                me,
+                htf.translation,
+                now,
+                dt,
+                &live,
+                &mut commands,
+                &mut rng,
+                &mut fx,
+                &mut pending,
+                &mut hits,
+                &speed_of,
+            ),
+        }
+    }
+}
+
+/// One hero's auto-casts: every owned ability whose cooldown is up fires at what its kind picks.
+#[allow(clippy::too_many_arguments)]
+fn cast_for(
+    run: &mut Run,
+    me: Entity,
+    hpos: Vec3,
+    now: f32,
+    dt: f32,
+    live: &[(Entity, Vec3, f32, f32)],
+    commands: &mut Commands,
+    rng: &mut Rng,
+    fx: &mut Fx,
+    pending: &mut PendingHits,
+    hits: &mut MessageWriter<Hit>,
+    speed_of: &dyn Fn(u32) -> f32,
+) {
+    if run.dead_t.is_some() {
+        return;
+    }
+    let stats = run.stats();
+    let mut foes: Vec<Foe> = live
+        .iter()
+        .map(|&(e, pos, hp, radius)| Foe {
+            e,
+            pos,
+            hp,
+            dist: hero::reach(hpos, pos),
+            radius,
+        })
+        .collect();
+    foes.sort_by(|a, b| a.dist.total_cmp(&b.dist));
 
     for i in 0..run.abilities.len() {
         run.abilities[i].cd -= dt;
@@ -276,14 +354,14 @@ pub(super) fn cast_abilities(
                         fx.cast(me, def.spell, &entities(&targets), None);
                     }
                     for f in &targets {
-                        let (dmg, crit) = roll(&mut rng, stats.crit, p.dmg);
+                        let (dmg, crit) = roll(rng, stats.crit, p.dmg);
                         let delay = if speed > 0.0 { f.dist / speed } else { 0.0 };
                         schedule(
-                            &mut pending,
-                            &mut hits,
+                            pending,
+                            hits,
                             now,
                             delay,
-                            hit_for(def, &p, f.e, dmg, crit),
+                            hit_for(def, &p, f.e, dmg, crit, me),
                         );
                     }
                     true
@@ -305,14 +383,14 @@ pub(super) fn cast_abilities(
                 } else {
                     fx.cast(me, def.spell, &entities(&targets), None);
                     for f in &targets {
-                        let (dmg, crit) = roll(&mut rng, stats.crit, p.dmg);
+                        let (dmg, crit) = roll(rng, stats.crit, p.dmg);
                         let delay = if speed > 0.0 { f.dist / speed } else { 0.0 };
                         schedule(
-                            &mut pending,
-                            &mut hits,
+                            pending,
+                            hits,
                             now,
                             delay,
-                            hit_for(def, &p, f.e, dmg, crit),
+                            hit_for(def, &p, f.e, dmg, crit, me),
                         );
                     }
                     true
@@ -337,7 +415,7 @@ pub(super) fn cast_abilities(
                         } else {
                             let serial = run.guid();
                             units::spawn_area_object(
-                                &mut commands,
+                                commands,
                                 serial,
                                 def.spell,
                                 p.radius,
@@ -356,6 +434,8 @@ pub(super) fn cast_abilities(
                             effect: def.effect,
                             mark: def.mark,
                             impact: if def.overhead { def.spell } else { 0 },
+                            crit: stats.crit,
+                            src: Some(me),
                         });
                         true
                     }
@@ -384,13 +464,13 @@ pub(super) fn cast_abilities(
                     fx.cast(me, def.spell, &entities(&chain), None);
                     for (k, f) in chain.iter().enumerate() {
                         let (dmg, crit) =
-                            roll(&mut rng, stats.crit, p.dmg * 0.85f32.powi(k as i32));
+                            roll(rng, stats.crit, p.dmg * 0.85f32.powi(k as i32));
                         schedule(
-                            &mut pending,
-                            &mut hits,
+                            pending,
+                            hits,
                             now,
                             0.08 * k as f32,
-                            hit_for(def, &p, f.e, dmg, crit),
+                            hit_for(def, &p, f.e, dmg, crit, me),
                         );
                     }
                     true
@@ -414,11 +494,11 @@ pub(super) fn cast_abilities(
                     for f in &targets {
                         let delay = if speed > 0.0 { f.dist / speed } else { 0.0 };
                         schedule(
-                            &mut pending,
-                            &mut hits,
+                            pending,
+                            hits,
                             now,
                             delay,
-                            hit_for(def, &p, f.e, 0.0, false),
+                            hit_for(def, &p, f.e, 0.0, false, me),
                         );
                     }
                     true
@@ -433,8 +513,8 @@ pub(super) fn cast_abilities(
                         fx.impact(f.e, def.spell);
                     }
                     for f in &targets {
-                        let (dmg, crit) = roll(&mut rng, stats.crit, p.dmg);
-                        hits.write(hit_for(def, &p, f.e, dmg, crit));
+                        let (dmg, crit) = roll(rng, stats.crit, p.dmg);
+                        hits.write(hit_for(def, &p, f.e, dmg, crit, me));
                     }
                     true
                 }
@@ -446,8 +526,8 @@ pub(super) fn cast_abilities(
                 } else {
                     for f in &targets {
                         fx.impact(f.e, 403);
-                        let (dmg, crit) = roll(&mut rng, stats.crit, p.dmg);
-                        hits.write(hit_for(def, &p, f.e, dmg, crit));
+                        let (dmg, crit) = roll(rng, stats.crit, p.dmg);
+                        hits.write(hit_for(def, &p, f.e, dmg, crit, me));
                     }
                     true
                 }
@@ -499,7 +579,7 @@ pub(super) fn cast_abilities(
                     let pos = hpos + Vec3::new(a.cos(), 0.0, a.sin()) * 2.0;
                     let serial = run.guid();
                     let totem = units::spawn_unit(
-                        &mut commands,
+                        commands,
                         &UnitSpec {
                             serial,
                             display: def.totem.0,
@@ -521,6 +601,8 @@ pub(super) fn cast_abilities(
                         left: p.duration,
                         tick: 0.3,
                         pulse: def.key == "magma_totem",
+                        crit: stats.crit,
+                        src: Some(me),
                     });
                     true
                 } else {
@@ -551,7 +633,6 @@ pub(super) fn tick_areas(
     if dt <= 0.0 {
         return;
     }
-    let stats = run.stats();
     let now = run.elapsed;
     let live: Vec<Foe> = enemies
         .iter()
@@ -577,7 +658,7 @@ pub(super) fn tick_areas(
                 if area.impact != 0 && i < 12 {
                     fx.impact(f.e, area.impact);
                 }
-                let (dmg, crit) = roll(&mut rng, stats.crit, area.damage);
+                let (dmg, crit) = roll(&mut rng, area.crit, area.damage);
                 hits.write(Hit {
                     target: f.e,
                     damage: dmg,
@@ -589,6 +670,7 @@ pub(super) fn tick_areas(
                     splash: 0.0,
                     crit,
                     color: COLOR_SPELL,
+                    src: area.src,
                 });
             }
         }
@@ -619,9 +701,10 @@ pub(super) fn tick_areas(
             }
             fx.cast(e, totem.cast, &[], None);
             for f in &targets {
-                let (dmg, crit) = roll(&mut rng, stats.crit, totem.damage);
+                let (dmg, crit) = roll(&mut rng, totem.crit, totem.damage);
                 hits.write(Hit {
                     color: COLOR_SPELL,
+                    src: totem.src,
                     ..Hit::direct(f.e, dmg, crit)
                 });
             }
@@ -639,7 +722,7 @@ pub(super) fn tick_areas(
                 .and_then(|s| s.catalog.get(totem.cast))
                 .map_or(0.0, |d| d.speed);
             let delay = if speed > 0.0 { dist / speed } else { 0.0 };
-            let (dmg, crit) = roll(&mut rng, stats.crit, totem.damage);
+            let (dmg, crit) = roll(&mut rng, totem.crit, totem.damage);
             schedule(
                 &mut pending,
                 &mut hits,
@@ -647,6 +730,7 @@ pub(super) fn tick_areas(
                 delay,
                 Hit {
                     color: COLOR_SPELL,
+                    src: totem.src,
                     ..Hit::direct(f.e, dmg, crit)
                 },
             );
@@ -673,6 +757,7 @@ pub(super) fn apply_hits(
     mut fx: Fx,
     mut loot: MessageWriter<Loot>,
     mut fields: MessageWriter<FieldChanged>,
+    mut mates: Query<&mut Mate>,
 ) {
     let dt = time.delta_secs();
     let now = run.elapsed;
@@ -740,11 +825,15 @@ pub(super) fn apply_hits(
         }
         if dmg > 0.0 {
             en.hp -= dmg;
-            run.damage_done += f64::from(dmg);
             fx.number(e, dmg, h.crit, h.color);
+            let owner = owner_of(&mut run, &mut mates, h.src);
+            owner.damage_done += f64::from(dmg);
             if let Effect::Drain(frac) = h.effect {
-                let max = run.stats().max_hp;
-                run.hp = (run.hp + dmg * frac).min(max);
+                // A fallen caster's drain heals no one.
+                if owner.dead_t.is_none() {
+                    let max = owner.stats().max_hp;
+                    owner.hp = (owner.hp + dmg * frac).min(max);
+                }
             }
         }
         if h.dot > 0.0 && h.dot_dur > 0.0 {
@@ -755,6 +844,7 @@ pub(super) fn apply_hits(
                 dps: h.dot,
                 left: h.dot_dur,
                 tick: 1.0,
+                src: h.src,
             });
         }
         let boss = en.boss;
@@ -790,18 +880,22 @@ pub(super) fn apply_hits(
             continue;
         }
         let mut dealt = 0.0;
+        let mut by: Vec<(Option<Entity>, f32)> = Vec::new();
         for d in &mut en.dots {
             d.left -= dt;
             d.tick -= dt;
             if d.tick <= 0.0 {
                 d.tick += 1.0;
                 dealt += d.dps;
+                by.push((d.src, d.dps));
             }
         }
         en.dots.retain(|d| d.left > 0.0);
         if dealt > 0.0 {
             en.hp -= dealt;
-            run.damage_done += f64::from(dealt);
+            for (src, dps) in by {
+                owner_of(&mut run, &mut mates, src).damage_done += f64::from(dps);
+            }
             fx.number(e, dealt, false, COLOR_SPELL);
             if en.hp <= 0.0 {
                 kill(&mut commands, &mut run, e, tf.translation, &mut en);
@@ -811,4 +905,18 @@ pub(super) fn apply_hits(
             }
         }
     }
+}
+
+/// The run a hit's damage counts on: a co-op guest's when its hero cast it, else the local one.
+fn owner_of<'a>(
+    run: &'a mut Run,
+    mates: &'a mut Query<&mut Mate>,
+    src: Option<Entity>,
+) -> &'a mut Run {
+    if let Some(s) = src {
+        if let Ok(m) = mates.get_mut(s) {
+            return &mut m.into_inner().run;
+        }
+    }
+    run
 }
