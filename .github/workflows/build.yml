@@ -1,0 +1,64 @@
+# Builds the Windows exe of Warcraft Survivors (with co-op) and checks the code on Linux.
+name: build
+on:
+  push:
+  workflow_dispatch:
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      WOW_DATA: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: System libraries
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libasound2-dev libudev-dev
+      - name: Toolchain
+        run: rustup toolchain install && rustc -V
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux
+      - name: Check
+        run: cargo check -p warcraft-survivors --no-default-features 2>&1 | tee check.log
+      - name: Co-op tests
+        run: cargo test -p benilla-app --no-default-features --lib survivors 2>&1 | tee test.log
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-logs
+          path: "*.log"
+          if-no-files-found: ignore
+
+  windows:
+    needs: check
+    runs-on: windows-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install; rustc -V
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows
+      - name: Build
+        run: cargo build --release -p warcraft-survivors --no-default-features
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/warcraft-survivors.exe dist/
+          Copy-Item packaging/windows/* dist/ -Recurse -ErrorAction SilentlyContinue
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AzerothSurvivors-Windows
+          path: dist/
